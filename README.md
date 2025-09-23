@@ -1,5 +1,12 @@
 # Redis CESC + RAG Chatbot Demo
 
+## Architecture
+
+![Redis CESC Architecture](images/cesc_redis.png)
+
+The diagram above shows how profile, short-term memory, long-term memory,
+semantic router, semantic cache, and RAG interact in the workflow.
+
 ## Overview
 This project is a **demo application** showcasing how to use **Redis** as the backbone for building
 a Context-Enabled Semantic Cache (CESC) combined with Retrieval-Augmented Generation (RAG).
