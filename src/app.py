@@ -1,0 +1,21 @@
+from src.rag.ingest import seed_if_empty
+from src.ui.gradio_app import build
+from src.config import SERVER_PORT
+from src.schema import kb_schema, cache_schema
+from redisvl.index import SearchIndex
+from src.db.redis_client import r
+from src.routing.semantic_router import init_router   # ⬅️ add this
+
+# ensure indexes exist at startup
+for schema in (kb_schema, cache_schema):
+    idx = SearchIndex.from_dict(schema, client=r)
+    if not idx.exists():
+        idx.create(overwrite=False)
+
+seed_if_empty()
+init_router(overwrite=False)
+
+
+if __name__ == "__main__":
+    app = build()
+    app.launch(server_name="0.0.0.0", server_port=SERVER_PORT)
