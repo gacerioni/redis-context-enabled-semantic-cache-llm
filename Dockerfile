@@ -1,18 +1,17 @@
-
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps for pypdf and friends (very light)
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install only the minimal runtime deps
+# Copy only the minimal requirements file
 COPY requirements-docker.txt .
 RUN pip install --no-cache-dir -r requirements-docker.txt
 
-# Copy the app
+# Copy the app source
 COPY . .
 
 EXPOSE 7860

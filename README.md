@@ -96,7 +96,7 @@ You can build and run the demo using the included `Dockerfile`:
 
 ```bash
 docker build -t redis-cesc-rag-demo .
-docker run -p 7860:7860 --env-file .env redis-cesc-rag-demo
+docker run -p 7860:7860 --env-file .env-docker redis-cesc-rag-demo
 ```
 
 ---
