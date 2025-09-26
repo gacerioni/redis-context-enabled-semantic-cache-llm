@@ -1,0 +1,1390 @@
+from src.rag.ingest import seed_if_empty
+from src.ui.gradio_app import build
+from src.config import SERVER_PORT
+from src.schema import kb_schema, cache_schema
+from redisvl.index import SearchIndex
+from src.db.redis_client import r
+from src.routing.semantic_router import init_router   # ⬅️ add this
+
+# ensure indexes exist at startup
+for schema in (kb_schema, cache_schema):
+    idx = SearchIndex.from_dict(schema, client=r)
+    if not idx.exists():
+        idx.create(overwrite=False)
+
+seed_if_empty()
+init_router(overwrite=False)
+
+
+if __name__ == "__main__":
+    app = build()
+    app.launch(server_name="0.0.0.0", server_port=SERVER_PORT)import json, uuid, time
+from typing import Any, Dict, Optional
+from redisvl.index import SearchIndex
+from redisvl.query import VectorQuery
+from src.schema import cache_schema, CACHE_PREFIX
+from src.llm import embed
+from src.db.redis_client import r
+
+def ensure_cache_index():
+    idx = SearchIndex.from_dict(cache_schema, client=r)
+    if not idx.exists():
+        idx.create(overwrite=False)
+
+def lookup(prompt: str, k: int = 1, threshold: float = 0.12) -> Optional[Dict[str, Any]]:
+    ensure_cache_index()
+    qvec = embed([prompt])[0]
+    vq = VectorQuery(
+        qvec,  # vector
+        "embedding",  # vector_field_name
+        return_fields=["prompt", "generic_answer", "meta"],
+        num_results=k,
+        return_score=True
+    )
+    idx = SearchIndex.from_dict(cache_schema, client=r)
+    res = idx.query(vq)  # may be list or object
+
+    rows = res if isinstance(res, list) else getattr(res, "results", [])
+    if not rows:
+        return None
+
+    best = rows[0]
+    score_field = VectorQuery.DISTANCE_ID
+    if float(best[score_field]) <= threshold:
+        return {
+            "prompt": best["prompt"],
+            "generic_answer": best["generic_answer"],
+            "meta": best.get("meta", "{}"),
+        }
+    return None
+
+def store(prompt: str, generic_answer: str, meta: Dict[str, Any]):
+    ensure_cache_index()
+    key = f"{CACHE_PREFIX}{uuid.uuid4()}"
+    payload = {
+        "qa_id": key.split(":")[-1],
+        "prompt": prompt,
+        "generic_answer": generic_answer,
+        "meta": json.dumps({**meta, "created_at": int(time.time())}),
+        "embedding": embed([prompt])[0],
+    }
+    r.json().set(key, "$", payload)import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1536"))
+PREMIUM_LLM = os.getenv("PREMIUM_LLM", "gpt-4o")
+CHEAP_LLM = os.getenv("CHEAP_LLM", "gpt-4o-mini")
+
+SERVER_PORT = int(os.getenv("SERVER_PORT", "7860"))
+
+# Chat memory
+ST_HISTORY_TTL_SEC = 60 * 30
+DEFAULT_USER_ID = "demo_user"import redis
+from src.config import REDIS_URL
+
+r = redis.from_url(REDIS_URL, decode_responses=True)from typing import List, Dict
+from openai import OpenAI
+from src.config import OPENAI_API_KEY, EMBED_MODEL, PREMIUM_LLM, CHEAP_LLM
+
+_oai = OpenAI(api_key=OPENAI_API_KEY)
+
+def embed(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = _oai.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
+
+def complete(system: str, messages: List[Dict[str, str]], model: str = PREMIUM_LLM,
+             max_tokens: int = 500, temperature: float = 0.2) -> str:
+    resp = _oai.chat.completions.create(
+        model=model,
+        messages=[{"role":"system","content":system}] + messages,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    return resp.choices[0].message.content
+
+PERSONALIZER_SYS = (
+    "You are a helpful assistant that PERSONALIZES a generic answer using "
+    "the provided user profile, recent chat messages, the semantic route, and RAG snippets. "
+    "Respect the user's tone/locale from the profile. Keep responses concise, structured, and direct."
+)
+
+PREMIUM_SYS = (
+    "You are a STRICT RAG assistant. Use ONLY the provided context blocks to answer: "
+    "[USER PROFILE], [RECENT MESSAGES], [SEMANTIC ROUTE], and [RAG]. "
+    "If the information is missing or insufficient, explicitly say what is unknown and do not invent facts. "
+    "Prefer bullet points and short paragraphs. Keep answers concise and helpful."
+)
+
+CHEAP_MODEL = CHEAP_LLM
+PREMIUM_MODEL = PREMIUM_LLM# src/memory/long_term.py
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Tuple
+import time, hashlib, math
+
+from src.db.redis_client import r
+
+# ---------- Model ----------
+
+@dataclass
+class LTMFact:
+    id: str                  # stable id (hash of type+value)
+    type: str                # e.g., "org", "role", "preference", "tool", "goal", "constraint"
+    value: str               # the fact itself, normalized text
+    source: str              # "manual", "conversation", "upload", etc.
+    confidence: float        # 0..1
+    first_seen: float        # epoch seconds
+    last_seen: float         # epoch seconds
+    count: int               # observation count
+    expires_at: Optional[float] = None  # optional epoch seconds
+
+# ---------- Keys ----------
+
+def lt_map_key(user_id: str) -> str:
+    # RedisJSON object: { "facts": { "<id>": <LTMFact>, ... }, "order": ["<id>", ...] }
+    return f"user:{user_id}:ltm"
+
+# ---------- Helpers ----------
+
+def _fact_id(f_type: str, value: str) -> str:
+    base = f"{f_type}::{value.strip().lower()}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+
+def _now() -> float:
+    return time.time()
+
+def _ensure_root(key: str):
+    try:
+        doc = r.json().get(key)
+    except Exception:
+        doc = None
+    if not isinstance(doc, dict):
+        r.json().set(key, "$", {"facts": {}, "order": []})
+
+# ---------- Public API ----------
+
+def upsert_fact(
+    user_id: str,
+    f_type: str,
+    value: str,
+    *,
+    source: str = "conversation",
+    confidence: float = 0.8,
+    ttl_seconds: Optional[int] = None,
+) -> LTMFact:
+    """
+    Insert/update a structured fact with dedupe + stats.
+    """
+    key = lt_map_key(user_id)
+    _ensure_root(key)
+
+    fid = _fact_id(f_type, value)
+    path = f"$.facts.{fid}"
+    now = _now()
+
+    # read existing
+    existing = r.json().get(key, path)
+    if existing:
+        # update counters + recency (no overwrite of value/type)
+        existing["last_seen"] = now
+        existing["count"] = int(existing.get("count", 1)) + 1
+        # keep max confidence, keep the most recent source (optional)
+        existing["confidence"] = max(float(existing.get("confidence", 0.0)), float(confidence))
+        existing["source"] = source or existing.get("source", "conversation")
+        if ttl_seconds and ttl_seconds > 0:
+            existing["expires_at"] = now + ttl_seconds
+        r.json().set(key, path, existing)
+        fact = LTMFact(**existing)
+    else:
+        fact = LTMFact(
+            id=fid,
+            type=f_type,
+            value=value.strip(),
+            source=source,
+            confidence=float(confidence),
+            first_seen=now,
+            last_seen=now,
+            count=1,
+            expires_at=(now + ttl_seconds) if (ttl_seconds and ttl_seconds > 0) else None,
+        )
+        r.json().set(key, path, asdict(fact))
+        # push id to order (MRU at the end)
+        r.json().arrappend(key, "$.order", fact.id)
+
+    _prune_if_needed(user_id)
+    return fact
+
+def get_all_facts(user_id: str) -> List[LTMFact]:
+    key = lt_map_key(user_id)
+    doc = r.json().get(key) or {}
+    facts = (doc.get("facts") or {}) if isinstance(doc, dict) else {}
+    out: List[LTMFact] = []
+    now = _now()
+    for obj in facts.values():
+        # filter expired
+        exp = obj.get("expires_at")
+        if exp and now > float(exp):
+            continue
+        out.append(LTMFact(**obj))
+    return out
+
+def rank_facts(
+    user_id: str,
+    *,
+    limit: int = 8,
+    now: Optional[float] = None,
+) -> List[LTMFact]:
+    """
+    Score = α*log(1+count) + β*recency_decay + γ*confidence
+    recency_decay = exp(-(now - last_seen)/tau), tau ~ 14 days
+    """
+    facts = get_all_facts(user_id)
+    if not facts:
+        return []
+
+    now = now or _now()
+    tau = 14 * 24 * 3600.0  # ~2 weeks
+    α, β, γ = 0.6, 0.3, 0.1
+
+    def score(f: LTMFact) -> float:
+        recency = math.exp(-(now - float(f.last_seen)) / tau)
+        return α * math.log1p(max(0, int(f.count))) + β * recency + γ * float(f.confidence)
+
+    ranked = sorted(facts, key=score, reverse=True)
+    return ranked[:limit]
+
+def delete_fact(user_id: str, fid: str) -> bool:
+    key = lt_map_key(user_id)
+    _ensure_root(key)
+    # remove object
+    deleted = r.json().forget(key, f"$.facts.{fid}")  # returns number of paths removed
+    # remove from order
+    try:
+        order = r.json().get(key, "$.order")[0]  # path get returns a list
+    except Exception:
+        order = []
+    if fid in order:
+        order.remove(fid)
+        r.json().set(key, "$.order", order)
+    return bool(deleted)
+
+def clear_all(user_id: str):
+    key = lt_map_key(user_id)
+    r.json().set(key, "$", {"facts": {}, "order": []})
+
+def _prune_if_needed(user_id: str, cap: int = 128):
+    """
+    Keep at most `cap` facts (drop the lowest scoring/oldest).
+    """
+    key = lt_map_key(user_id)
+    try:
+        order = r.json().get(key, "$.order")[0]
+    except Exception:
+        order = []
+    if len(order) <= cap:
+        return
+    # drop oldest from the front until size==cap
+    to_drop = len(order) - cap
+    for _ in range(to_drop):
+        fid = order.pop(0)
+        r.json().forget(key, f"$.facts.{fid}")
+    r.json().set(key, "$.order", order)import json, time
+from typing import Dict, List
+from src.db.redis_client import r
+from src.config import ST_HISTORY_TTL_SEC
+
+def st_history_key(session_id: str) -> str:
+    return f"chat:{session_id}:history"
+
+def append_short_term(session_id: str, role: str, content: str):
+    key = st_history_key(session_id)
+    entry = json.dumps({"t": int(time.time()), "role": role, "content": content})
+    r.rpush(key, entry); r.expire(key, ST_HISTORY_TTL_SEC)
+
+def get_short_term(session_id: str, k: int = 6) -> List[Dict[str, str]]:
+    key = st_history_key(session_id)
+    n = r.llen(key)
+    if n <= 0:
+        return []
+    raw = r.lrange(key, max(0, n - k), -1)
+    return [json.loads(x) for x in raw]from typing import Dict
+from src.db.redis_client import r
+
+def profile_key(user_id: str) -> str:
+    return f"user:{user_id}:profile"
+
+def upsert_profile(user_id: str, profile: Dict[str, str]):
+    r.hset(profile_key(user_id), mapping=profile)
+
+def get_profile(user_id: str) -> Dict[str, str]:
+    return r.hgetall(profile_key(user_id)) or {}from typing import List, Dict, Any
+from redisvl.index import SearchIndex
+from src.schema import kb_schema, KB_PREFIX
+from src.db.redis_client import r
+from src.utils.chunker import simple_chunk
+from src.llm import embed
+import os  # NEW
+
+class Doc:
+    def __init__(self, doc_id: str, source: str, text: str):
+        self.doc_id = doc_id
+        self.source = source
+        self.text = text
+
+SEED_DOCS = [
+    Doc("banking_faq_1", "kb/banking_faq_1",
+        "Checking accounts allow unlimited withdrawals; savings may limit transfers. "
+        "Interest varies by product. Wire transfers have cutoff times/fees; domestic wires can settle same-day."),
+    Doc("trading_basics_1", "kb/trading_basics_1",
+        "Market orders execute at best price. Limit orders set bounds. "
+        "Stop-loss helps manage downside risk in volatility."),
+    Doc("security_compliance_1", "kb/security_compliance_1",
+        "Use least-privilege for customer data. Access reviews quarterly. MFA required for admin consoles."),
+]
+
+def ensure_kb_index():
+    idx = SearchIndex.from_dict(kb_schema, client=r)
+    if not idx.exists():
+        idx.create(overwrite=False)
+
+def upsert_kb(docs: List[Doc]):
+    ensure_kb_index()
+    pipe = r.pipeline()
+    for d in docs:
+        chunks = simple_chunk(d.text)
+        embs = embed(chunks)
+        file_name = os.path.basename(d.source) if d.source else ""  # NEW
+        for i, (ch, vec) in enumerate(zip(chunks, embs)):
+            key = f"{KB_PREFIX}{d.doc_id}:{i}"
+            payload: Dict[str, Any] = {
+                "doc_id": d.doc_id,
+                "chunk_id": f"{d.doc_id}:{i}",
+                "chunk_index": i,            # NEW
+                "file_name": file_name,      # NEW
+                "text": ch,
+                "source": d.source,
+                "embedding": vec,
+            }
+            pipe.json().set(key, "$", payload)
+    pipe.execute()
+
+def seed_if_empty():
+    if not list(r.scan_iter(f"{KB_PREFIX}*")):
+        upsert_kb(SEED_DOCS)from typing import List, Tuple, Dict, Any, Union
+from pypdf import PdfReader
+import hashlib, os
+import io
+
+from src.rag.ingest import Doc, upsert_kb
+from src.utils.chunker import simple_chunk
+
+def _sha1(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def _read_pdf_bytes(obj: Union[str, bytes, Dict[str, Any]]) -> tuple[str, bytes]:
+    """
+    Normalize different Gradio Files payload shapes into (name, bytes).
+    Supports:
+      - bytes (type='binary' in some Gradio versions)
+      - str (file path when type='filepath')
+      - dict with {'name','data'} (other Gradio versions)
+      - dict with {'path'} or {'tempfile'}
+    """
+    # 1) direct bytes
+    if isinstance(obj, (bytes, bytearray)):
+        return ("upload.pdf", bytes(obj))
+
+    # 2) filepath
+    if isinstance(obj, str):
+        path = obj
+        name = os.path.basename(path) or "upload.pdf"
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return (name, data)
+
+    # 3) dict payload
+    if isinstance(obj, dict):
+        name = obj.get("name") or "upload.pdf"
+        data = obj.get("data")
+        if data:
+            return (name, data)
+        # maybe only a path/tempfile was provided
+        path = obj.get("path") or obj.get("tempfile")
+        if path and os.path.exists(path):
+            with open(path, "rb") as fh:
+                data = fh.read()
+            return (os.path.basename(path) or name, data)
+
+    # fallback
+    return ("upload.pdf", b"")
+
+def extract_text_from_pdf_bytes(content: bytes) -> str:
+    """
+    Robust text extraction from PDF bytes. Skips empty pages.
+    """
+    reader = PdfReader(io.BytesIO(content))
+    if getattr(reader, "is_encrypted", False):
+        try:
+            reader.decrypt("")  # attempt empty-password decrypt
+        except Exception:
+            pass
+    pages = []
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        t = t.strip()
+        if t:
+            pages.append(t)
+    return "\n\n".join(pages).strip()
+
+def build_doc_from_pdf(name: str, content: bytes) -> Doc:
+    """
+    Build a Doc object (doc_id, source, text) from a PDF.
+    - doc_id: sha1 of bytes + sanitized filename (stable for de-dupe)
+    - source: "upload/{filename}"
+    """
+    doc_hash = _sha1(content)[:12]
+    base = os.path.splitext(os.path.basename(name) or "upload")[0]
+    doc_id = f"pdf_{base}_{doc_hash}"
+    text = extract_text_from_pdf_bytes(content)
+    return Doc(
+        doc_id=doc_id,
+        source=f"upload/{os.path.basename(name) or 'upload.pdf'}",
+        text=text
+    )
+
+def ingest_uploaded_pdfs(files: List[Union[str, bytes, Dict[str, Any]]]) -> Tuple[int, int, List[str]]:
+    """
+    Accepts Gradio Files payload in multiple shapes (bytes, filepaths, or dicts).
+    Returns: (num_docs, total_chunks, doc_ids)
+    """
+    docs: List[Doc] = []
+    total_chunks = 0
+    doc_ids: List[str] = []
+
+    for f in files or []:
+        name, data = _read_pdf_bytes(f)
+        if not data:
+            continue
+
+        doc = build_doc_from_pdf(name=name, content=data)
+        if not doc.text:
+            # likely an image-only PDF; skip silently (or log)
+            continue
+
+        # pre-count chunks (mirrors simple_chunk inside upsert)
+        total_chunks += len(simple_chunk(doc.text))
+        doc_ids.append(doc.doc_id)
+        docs.append(doc)
+
+    if docs:
+        upsert_kb(docs)  # embeds + JSON.SET at root + pipeline
+
+    return len(docs), total_chunks, doc_idsfrom typing import Any, Dict, List
+from redisvl.index import SearchIndex
+from redisvl.query import VectorQuery
+from src.schema import kb_schema
+from src.llm import embed
+from src.db.redis_client import r
+
+def rag_search(query: str, topk: int = 3) -> List[Dict[str, Any]]:
+    qvec = embed([query])[0]
+    vq = VectorQuery(
+        qvec,                 # vector
+        "embedding",          # vector_field_name
+        return_fields=[
+            "text",
+            "source",
+            "doc_id",
+            "chunk_id",
+            "file_name",       # NEW
+            "chunk_index",     # NEW
+        ],
+        num_results=topk,
+        return_score=True
+    )
+    idx = SearchIndex.from_dict(kb_schema, client=r)
+    res = idx.query(vq)  # may return a list OR an object with .results
+
+    # Normalize rows across redisvl variants
+    rows = res if isinstance(res, list) else getattr(res, "results", [])
+
+    score_field = VectorQuery.DISTANCE_ID  # e.g., "__v_score"
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append({
+            "text": row.get("text", ""),
+            "source": row.get("source", ""),
+            "doc_id": row.get("doc_id", ""),
+            "chunk_id": row.get("chunk_id", ""),
+            "file_name": row.get("file_name", ""),              # NEW
+            "chunk_index": row.get("chunk_index", None),        # NEW
+            "score": float(row.get(score_field, 0.0)),
+        })
+    return out# src/routing/semantic_router.py
+import os
+from typing import Dict, Any
+from redisvl.extensions.router import SemanticRouter, Route
+from redisvl.utils.vectorize import OpenAITextVectorizer
+from src.config import REDIS_URL, EMBED_MODEL
+
+# Dica: deixe o threshold ~0.70–0.78. Mais baixo = mais “fácil” de casar rota.
+# Adicione exemplos em pt-BR e en-US para robustez.
+
+technology = Route(
+    name="technology",
+    references=[
+        "latest advancements in AI",
+        "newest gadgets",
+        "what's trending in tech",
+        "quantum computing news",
+        "is 5G available everywhere",
+        "explain edge computing",
+        "tendências em tecnologia",
+        "o que é computação de borda",
+    ],
+    metadata={"category": "tech"},
+    distance_threshold=0.72,
+)
+
+sports = Route(
+    name="sports",
+    references=[
+        "who won the game last night",
+        "upcoming sports events",
+        "latest sports news",
+        "results for NBA and NFL",
+        "cricket match updates",
+        "Olympics schedule",
+        "jogo do corinthians",
+        "tabela do brasileirão",
+    ],
+    metadata={"category": "sports"},
+    distance_threshold=0.72,
+)
+
+entertainment = Route(
+    name="entertainment",
+    references=[
+        "top movies right now",
+        "who won the Oscars",
+        "celebrity news",
+        "upcoming TV shows and films",
+        "trending series on Netflix",
+        "novidades no entretenimento",
+    ],
+    metadata={"category": "entertainment"},
+    distance_threshold=0.70,
+)
+
+finance = Route(
+    name="finance",
+    references=[
+        "latest stock market trends",
+        "bitcoin price update",
+        "how to invest in ETFs",
+        "interest rate changes",
+        "best budgeting tips",
+        "explain inflation",
+        "como investir em renda fixa",
+        "taxa selic",
+        "CDI vs poupança",
+    ],
+    metadata={"category": "finance"},
+    distance_threshold=0.73,
+)
+
+health = Route(
+    name="health",
+    references=[
+        "tips for mental health",
+        "how to lose weight safely",
+        "flu and covid symptoms",
+        "healthy diets and routines",
+        "benefits of meditation",
+        "latest health research",
+        "alimentação saudável",
+        "sintomas de gripe",
+    ],
+    metadata={"category": "health"},
+    distance_threshold=0.74,
+)
+
+travel = Route(
+    name="travel",
+    references=[
+        "top destinations for 2025",
+        "is Japan open for travel",
+        "budget travel tips",
+        "visa requirements for US",
+        "backpacking Europe",
+        "travel safety advice",
+        "dicas de viagem baratas",
+        "preciso de visto para os EUA",
+    ],
+    metadata={"category": "travel"},
+    distance_threshold=0.72,
+)
+
+education = Route(
+    name="education",
+    references=[
+        "best online learning platforms",
+        "AI in classrooms",
+        "how to learn coding",
+        "top universities in Europe",
+        "study tips for students",
+        "education trends",
+        "plataformas de estudo online",
+        "como aprender programação",
+    ],
+    metadata={"category": "education"},
+    distance_threshold=0.73,
+)
+
+food = Route(
+    name="food",
+    references=[
+        "best recipes for dinner",
+        "easy vegan meals",
+        "restaurants near me",
+        "what's trending in food",
+        "how to cook steak properly",
+        "healthy snack ideas",
+        "restaurantes perto de mim",
+        "receitas fáceis",
+    ],
+    metadata={"category": "food"},
+    distance_threshold=0.71,
+)
+
+# ---- Novas rotas genéricas úteis para demos corporativas ----
+
+coding = Route(
+    name="coding",
+    references=[
+        "how to write python code",
+        "debug this error",
+        "explain this algorithm",
+        "help with unit tests",
+        "melhor prática em API design",
+        "escreva uma função em javascript",
+    ],
+    metadata={"category": "dev"},
+    distance_threshold=0.73,
+)
+
+devops = Route(
+    name="devops",
+    references=[
+        "docker compose not starting",
+        "kubernetes pod failing",
+        "ci/cd pipeline tips",
+        "observability best practices",
+        "infra as code examples",
+        "helm chart issues",
+    ],
+    metadata={"category": "devops"},
+    distance_threshold=0.74,
+)
+
+documentation = Route(
+    name="documentation",
+    references=[
+        "summarize this doc",
+        "extract key points from PDF",
+        "create a knowledge base article",
+        "improve clarity of this README",
+        "documentação do projeto",
+    ],
+    metadata={"category": "docs"},
+    distance_threshold=0.72,
+)
+
+customer_support = Route(
+    name="customer_support",
+    references=[
+        "how to respond to a complaint",
+        "refund policy explanation",
+        "triage steps for a ticket",
+        "escalation guidelines",
+        "roteiro de atendimento",
+    ],
+    metadata={"category": "support"},
+    distance_threshold=0.73,
+)
+
+hr = Route(
+    name="hr",
+    references=[
+        "vacation policy",
+        "how to request leave",
+        "benefits overview",
+        "onboarding checklist",
+        "policy compliance reminder",
+        "folga e férias",
+    ],
+    metadata={"category": "hr"},
+    distance_threshold=0.73,
+)
+
+legal = Route(
+    name="legal",
+    references=[
+        "nda template",
+        "contract review checklist",
+        "privacy policy summary",
+        "intellectual property basics",
+        "dados pessoais e LGPD",
+    ],
+    metadata={"category": "legal"},
+    distance_threshold=0.76,
+)
+
+shopping = Route(
+    name="shopping",
+    references=[
+        "best laptops under 1000",
+        "compare these products",
+        "which phone should I buy",
+        "dicas para economizar",
+        "qual o melhor custo-benefício",
+    ],
+    metadata={"category": "shopping"},
+    distance_threshold=0.72,
+)
+
+math_calc = Route(
+    name="math",
+    references=[
+        "solve this math problem",
+        "calculate percentage",
+        "explain statistics concept",
+        "derivative of a function",
+        "probability basics",
+    ],
+    metadata={"category": "math"},
+    distance_threshold=0.72,
+)
+
+general_chitchat = Route(
+    name="general",
+    references=[
+        "how are you",
+        "tell me a joke",
+        "what can you do",
+        "converse comigo",
+        "small talk",
+    ],
+    metadata={"category": "general"},
+    distance_threshold=0.70,
+)
+
+personal = Route(
+    name="personal",
+    references=[
+        "what is my name",
+        "where do I work",
+        "my preferences",
+        "minhas preferências",
+    ],
+    metadata={"category": "personal-stuff"},
+    distance_threshold=0.71,
+)
+
+# --- Build router (uses OpenAI embeddings; no heavy deps) ---
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+_vectorizer = OpenAITextVectorizer(model=EMBED_MODEL)
+
+# Lista única com todas as rotas:
+_ALL_ROUTES = [
+    technology, sports, entertainment, finance, health, travel, education, food,
+    coding, devops, documentation, customer_support, hr, legal, shopping, math_calc,
+    general_chitchat, personal
+]
+
+_router = SemanticRouter(
+    name="topic-router",
+    redis_url=REDIS_URL,
+    vectorizer=_vectorizer,
+    routes=_ALL_ROUTES,
+    overwrite=False,
+)
+
+def _build_router(overwrite: bool = False) -> SemanticRouter:
+    return SemanticRouter(
+        name="topic-router",
+        redis_url=REDIS_URL,
+        vectorizer=_vectorizer,
+        routes=_ALL_ROUTES,
+        overwrite=overwrite,
+    )
+
+def init_router(overwrite: bool = False) -> None:
+    global _router
+    if overwrite:
+        _router = _build_router(overwrite=True)
+    _ = _router("health check")
+    if overwrite:
+        _router = _build_router(overwrite=False)
+
+def route_query(text: str) -> Dict[str, Any]:
+    m = _router(text)
+    return {
+        "name": m.name if getattr(m, "name", None) else None,
+        "distance": float(getattr(m, "distance", 0.0)) if getattr(m, "name", None) else None,
+        "metadata": getattr(m, "metadata", {}) or {},
+    }from src.config import EMBED_DIM
+
+KB_INDEX_NAME = "idx:kb"
+KB_PREFIX = "kb:doc:chunk:"
+
+CACHE_INDEX_NAME = "idx:cache"
+CACHE_PREFIX = "cache:qa:"
+
+kb_schema = {
+    "index": {"name": KB_INDEX_NAME, "prefix": KB_PREFIX, "storage_type": "json"},
+    "fields": [
+        {"name": "doc_id", "type": "tag", "path": "$.doc_id"},
+        {"name": "chunk_id", "type": "tag", "path": "$.chunk_id"},
+        {"name": "chunk_index", "type": "numeric", "path": "$.chunk_index"},
+        {"name": "text", "type": "text", "path": "$.text"},
+        {"name": "source", "type": "text", "path": "$.source"},
+        {"name": "file_name", "type": "text", "path": "$.file_name"},
+        {
+            "name": "embedding",
+            "type": "vector",
+            "attrs": {
+                "algorithm": "hnsw",
+                "dims": EMBED_DIM,
+                "distance_metric": "cosine",
+                "datatype": "float32",
+                "path": "$.embedding",
+            },
+        },
+    ],
+}
+
+cache_schema = {
+    "index": {"name": CACHE_INDEX_NAME, "prefix": CACHE_PREFIX, "storage_type": "json"},
+    "fields": [
+        {"name": "qa_id", "type": "tag", "path": "$.qa_id"},
+        {"name": "prompt", "type": "text", "path": "$.prompt"},
+        {"name": "generic_answer", "type": "text", "path": "$.generic_answer"},
+        {"name": "meta", "type": "text", "path": "$.meta"},
+        {
+            "name": "embedding",
+            "type": "vector",
+            "attrs": {
+                "algorithm": "hnsw",
+                "dims": EMBED_DIM,
+                "distance_metric": "cosine",
+                "datatype": "float32",
+                "path": "$.embedding",
+            },
+        },
+    ],
+}# src/ui/gradio_app.py
+import uuid
+import gradio as gr
+from typing import List, Dict
+
+from src.config import (
+    DEFAULT_USER_ID,
+    EMBED_MODEL,
+    PREMIUM_LLM,
+    CHEAP_LLM,
+)
+from src.memory.short_term import append_short_term
+#from src.memory.long_term import add_longterm_fact
+from src.memory.short_term import append_short_term
+from src.profiles.user_profile import upsert_profile
+from src.workflows import answer_one
+from src.rag.pdf_ingest import ingest_uploaded_pdfs
+
+SESSION_ID = str(uuid.uuid4())
+
+
+def chat_fn(
+    message: str,
+    history: List[Dict[str, str]],
+    tone: str,
+    locale: str,
+    role: str,
+    interest: str,
+    persona: str,   # <-- novo
+):
+    """
+    history is a list of dicts in messages format:
+      [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
+    Must return (updated_history, cleared_textbox)
+    """
+    # Store/refresh user profile metadata (Hash)
+    upsert_profile(
+        DEFAULT_USER_ID,
+        {
+            "tone": tone,
+            "locale": locale,
+            "name": "Gabriel Cerioni",             # demo identity (pode vir da UI se quiser)
+            "role": role,
+            "interest": interest,
+            "company": "Bradesco",
+            "persona": persona,                    # <-- gravamos a persona escolhida
+            "mode": persona,                       # alias comum
+        },
+    )
+
+    # Persist some facts in long-term memory (RedisJSON array) – demo-only
+    #add_longterm_fact(DEFAULT_USER_ID, f"persona={persona}")
+    #add_longterm_fact(DEFAULT_USER_ID, f"locale={locale}")
+    #add_longterm_fact(DEFAULT_USER_ID, f"tone={tone}")
+
+    # Short-term memory: append user turn
+    append_short_term(SESSION_ID, "user", message)
+
+    # Orchestrate CESC flow and get reply
+    reply = answer_one(DEFAULT_USER_ID, SESSION_ID, message)
+
+    # Short-term memory: append assistant turn
+    append_short_term(SESSION_ID, "assistant", reply)
+
+    # Update messages-format history for Gradio Chatbot
+    new_history = (history or []) + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": reply},
+    ]
+    return new_history, ""  # clear the textbox
+
+
+def kb_ingest_fn(files: List[Dict]) -> str:
+    """
+    Accepts payload from gr.Files(type='binary' or 'filepath').
+    """
+    if not files:
+        return "No PDFs selected."
+    n_docs, n_chunks, ids = ingest_uploaded_pdfs(files)
+    if n_docs == 0:
+        return "No text extracted. Are these image-only PDFs?"
+    return f"✅ Ingested {n_docs} PDF(s), ~{n_chunks} chunk(s).\nIDs: {', '.join(ids)}"
+
+
+def clear_chat():
+    # Apenas limpa a interface; STM expira por TTL no Redis.
+    return [], ""
+
+
+def build():
+    with gr.Blocks(title="Redis CESC + RAG Demo") as demo:
+        # ===== HEADER =====
+        gr.Markdown(
+            "## Redis CESC + RAG — Demo\n"
+            "Assistente genérico com **Vector KB**, **memória** (curta e longa), **semantic cache**, **routing** e **upload de PDFs**.\n"
+        )
+
+        # ===== MODEL CARD =====
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown(
+                    f"**Embedding model:** `{EMBED_MODEL}`  \n"
+                    f"**Premium LLM (miss path):** `{PREMIUM_LLM}`  \n"
+                    f"**Cheap LLM (cache hit):** `{CHEAP_LLM}`"
+                )
+            with gr.Column(scale=1):
+                gr.Markdown(
+                    f"**User ID:** `{DEFAULT_USER_ID}`  \n"
+                    f"**Session:** `{SESSION_ID}`  \n"
+                    "*(IDs só para referência na demo)*"
+                )
+
+        # ===== USER CONTROLS =====
+        gr.Markdown("### Preferências do Usuário")
+        with gr.Row():
+            tone = gr.Dropdown(
+                ["concise", "friendly", "formal"], value="concise", label="Tone"
+            )
+            locale = gr.Dropdown(["pt-BR", "en-US"], value="pt-BR", label="Locale")
+            role = gr.Dropdown(
+                ["analyst", "customer", "manager", "financial advisor"],
+                value="financial advisor",
+                label="Role",
+            )
+            persona = gr.Dropdown(                   # <-- nova persona/mode
+                [
+                    "rag_strict",                   # usa apenas contexto, sem alucinar
+                    "creative_helper",              # escreve com mais liberdade
+                    "analyst",                      # foco em steps/bullets/justificativas
+                    "support_agent",                # tom empático e procedural
+                ],
+                value="rag_strict",
+                label="Persona/Mode",
+            )
+
+        with gr.Row():
+            interest = gr.Textbox(
+                placeholder="User interests (comma separated)",
+                value="investments, markets",
+                label="Interests",
+            )
+
+        # ===== PDF UPLOAD =====
+        with gr.Accordion("Add PDFs to Knowledge Base", open=False):
+            pdfs = gr.Files(label="Upload PDFs", file_types=[".pdf"], type="filepath")
+            with gr.Row():
+                ingest_btn = gr.Button("Ingest into KB")
+                ingest_status = gr.Markdown("")
+            ingest_btn.click(fn=kb_ingest_fn, inputs=[pdfs], outputs=[ingest_status])
+
+        # ===== CHAT AREA =====
+        gr.Markdown("### Chat")
+        chat = gr.Chatbot(height=460, type="messages", label="Assistant")
+        with gr.Row():
+            msg = gr.Textbox(
+                placeholder="Pergunte sobre documentação, código, viagens, esportes… (ou faça upload de PDFs acima)",
+                scale=4,
+            )
+            send = gr.Button("Send", variant="primary", scale=1)
+            clear = gr.Button("Clear", variant="secondary", scale=1)
+
+        # Wire inputs (Chatbot uses 'messages' format)
+        send.click(
+            fn=chat_fn,
+            inputs=[msg, chat, tone, locale, role, interest, persona],
+            outputs=[chat, msg],
+        )
+        msg.submit(
+            fn=chat_fn,
+            inputs=[msg, chat, tone, locale, role, interest, persona],
+            outputs=[chat, msg],
+        )
+        clear.click(fn=clear_chat, outputs=[chat, msg])
+
+    return demofrom typing import List
+from src.utils.tokens import count_tokens
+import re
+
+def simple_chunk(text: str, max_tokens: int = 400, overlap: int = 60) -> List[str]:
+    sents = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks, cur, cur_tok = [], [], 0
+    for s in sents:
+        t = count_tokens(s)
+        if cur_tok + t > max_tokens and cur:
+            chunks.append(" ".join(cur))
+            back, ot = [], 0
+            for sent in reversed(cur):
+                tt = count_tokens(sent)
+                if ot + tt <= overlap:
+                    back.append(sent); ot += tt
+                else:
+                    break
+            cur = list(reversed(back)); cur_tok = sum(count_tokens(x) for x in cur)
+        cur.append(s); cur_tok += t
+    if cur:
+        chunks.append(" ".join(cur))
+    return chunksimport tiktoken
+enc = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(s: str) -> int:
+    return len(enc.encode(s))# src/workflows.py
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, List, Tuple, Optional
+
+from src.llm import (
+    complete,
+    PERSONALIZER_SYS as DEFAULT_PERSONALIZER_SYS,
+    PREMIUM_SYS as DEFAULT_PREMIUM_SYS,
+    CHEAP_MODEL,
+    PREMIUM_MODEL,
+)
+
+# ---- LTM imports with graceful fallback to legacy get_longterm ----
+_LTM_STRUCTURED = False
+try:
+    # New structured LTM API (recommended)
+    from src.memory.long_term import upsert_fact, rank_facts, LTMFact  # type: ignore
+    _LTM_STRUCTURED = True
+except Exception:
+    # Legacy flat-list LTM (fallback)
+    from src.memory.long_term import get_longterm  # type: ignore
+
+from src.rag.search import rag_search
+from src.cache import semantic_cache as sc
+from src.profiles.user_profile import get_profile
+from src.memory.short_term import get_short_term
+from src.routing.semantic_router import route_query
+
+
+# ---------------------------
+# Persona-aware system prompts
+# ---------------------------
+
+# Baselines come from src/llm.py; we use them as fallbacks for unknown personas.
+BASE_PERSONALIZER = DEFAULT_PERSONALIZER_SYS
+BASE_PREMIUM = DEFAULT_PREMIUM_SYS
+
+PERSONA_PROMPTS: Dict[str, Dict[str, str]] = {
+    # Strict RAG: never invent; always cite/use provided context blocks.
+    "rag_strict": {
+        "personalizer": (
+            "You are a helpful assistant that PERSONALIZES a generic answer using the provided "
+            "user profile, long-term facts, recent chat messages, the semantic route, and RAG snippets. "
+            "Respect the user's tone/locale. Keep responses concise and structured. "
+            "If context is insufficient, clearly state what is missing."
+        ),
+        "premium": (
+            "You are a STRICT RAG assistant. Use ONLY the provided context blocks to answer: "
+            "[USER PROFILE], [LONG-TERM FACTS], [RECENT MESSAGES], [SEMANTIC ROUTE], and [RAG]. "
+            "If the information is missing or insufficient, say so explicitly and do not invent facts. "
+            "Prefer bullet points and short paragraphs."
+        ),
+    },
+
+    # Creative helper: allowed to generalize and rephrase, but still grounded when context exists.
+    "creative_helper": {
+        "personalizer": (
+            "You are a creative, friendly assistant. Personalize the generic answer using the user's profile, long-term facts, "
+            "recent chat, semantic route and RAG snippets. Be engaging but precise; do not invent facts. "
+            "Offer 1–2 extra helpful suggestions when appropriate."
+        ),
+        "premium": (
+            "You are a creative RAG assistant. Use the provided context blocks to answer clearly. "
+            "If context lacks details, you may add general best-practice guidance, but mark it as general advice. "
+            "Keep a friendly, helpful tone and avoid making up specific facts."
+        ),
+    },
+
+    # Analyst: structured reasoning, explicit steps, assumptions, trade-offs.
+    "analyst": {
+        "personalizer": (
+            "You are an analytical assistant. Personalize the generic answer using profile, long-term facts, recent chat, route, and RAG. "
+            "Be structured: list assumptions, steps, and trade-offs. Keep it concise and evidence-based."
+        ),
+        "premium": (
+            "You are an analytical RAG assistant. Use ONLY the provided context blocks. "
+            "Present the answer with numbered steps, key assumptions, and risks. "
+            "If context is insufficient, list the missing data and propose how to obtain it."
+        ),
+    },
+
+    # Support agent: empathetic, procedural, troubleshooting.
+    "support_agent": {
+        "personalizer": (
+            "You are an empathetic support agent. Personalize the generic answer using profile, long-term facts, recent chat, route, and RAG. "
+            "Acknowledge the user's situation, then give clear step-by-step guidance. Avoid jargon."
+        ),
+        "premium": (
+            "You are a support-focused RAG assistant. Use ONLY the provided context blocks. "
+            "Start with a brief acknowledgment, then provide step-by-step instructions. "
+            "If context is missing, state what is needed next and possible next actions."
+        ),
+    },
+}
+
+# Temperature / verbosity knobs per persona (tweak as you like)
+PERSONA_TEMPS: Dict[str, Dict[str, float]] = {
+    "rag_strict":      {"personalizer": 0.2, "premium": 0.1},
+    "creative_helper": {"personalizer": 0.5, "premium": 0.4},
+    "analyst":         {"personalizer": 0.25, "premium": 0.2},
+    "support_agent":   {"personalizer": 0.25, "premium": 0.2},
+}
+
+
+def _select_prompts_and_temps(persona: str) -> Tuple[str, str, float, float]:
+    """Return (personalizer_sys, premium_sys, temp_personalizer, temp_premium) for a persona."""
+    key = (persona or "").lower().strip()
+    prompts = PERSONA_PROMPTS.get(key)
+    temps = PERSONA_TEMPS.get(key)
+
+    # Fallback to baselines if persona not recognized
+    personalizer_sys = prompts["personalizer"] if prompts else BASE_PERSONALIZER
+    premium_sys = prompts["premium"] if prompts else BASE_PREMIUM
+    t_personalizer = temps["personalizer"] if temps else 0.2
+    t_premium = temps["premium"] if temps else 0.2
+    return personalizer_sys, premium_sys, t_personalizer, t_premium
+
+
+# ---------------------------
+# Lightweight fact extraction (only used when structured LTM is available)
+# ---------------------------
+
+_PREF_PAT = re.compile(r"\b(prefiro|prefer|gosto de|i prefer)\s+([^.;,\n]+)", re.IGNORECASE)
+_WORK_PAT = re.compile(r"\b(trabalho no|work at|i work at)\s+([^.;,\n]+)", re.IGNORECASE)
+_TEAM_PAT = re.compile(r"\b(time|squad|equipe|team)\s+([^.;,\n]+)", re.IGNORECASE)
+
+def _extract_candidate_facts(msg: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    if not msg:
+        return out
+
+    m = _PREF_PAT.search(msg)
+    if m:
+        out.append({"type": "preference", "value": m.group(2).strip()})
+
+    m = _WORK_PAT.search(msg)
+    if m:
+        out.append({"type": "org", "value": m.group(2).strip()})
+
+    m = _TEAM_PAT.search(msg)
+    if m:
+        out.append({"type": "team", "value": m.group(2).strip()})
+
+    return out
+
+
+def _promote_facts_from_turn(user_id: str, message: str) -> None:
+    """If structured LTM is present, upsert conservative facts from this turn."""
+    if not _LTM_STRUCTURED:
+        return
+    for f in _extract_candidate_facts(message):
+        try:
+            upsert_fact(
+                user_id,
+                f_type=f["type"],
+                value=f["value"],
+                source="conversation",
+                confidence=0.7,
+            )
+        except Exception:
+            # Never let LTM issues break the main flow
+            pass
+
+
+# ---------------------------
+# Context building
+# ---------------------------
+
+def _ltm_block(user_id: str) -> str:
+    """
+    Return a string block for LTM. If structured LTM is available, show top-ranked facts,
+    else fall back to the legacy list.
+    """
+    try:
+        if _LTM_STRUCTURED:
+            facts = rank_facts(user_id, limit=8) or []
+            if not facts:
+                return ""
+            lines = []
+            for f in facts:
+                # type: ignore[attr-defined]  (for mypy/pyright if dataclass is unknown)
+                seen = getattr(f, "count", 1)
+                ftype = getattr(f, "type", "fact")
+                value = getattr(f, "value", "")
+                lines.append(f"- [{ftype}] {value} (seen {seen}×)")
+            return "[LONG-TERM FACTS]\n" + "\n".join(lines)
+        else:
+            # Legacy list-of-strings
+            ltm_arr = get_longterm(user_id)
+            if not ltm_arr:
+                return ""
+            return "[LONG-TERM FACTS]\n" + "\n".join(f"- {s}" for s in ltm_arr)
+    except Exception:
+        return ""
+
+
+def build_context_blocks(user_id: str, session_id: str, query: str) -> Tuple[str, Dict[str, Any]]:
+    profile = get_profile(user_id) or {}
+    st = get_short_term(session_id) or []
+    route = route_query(query) or {}
+    rag = rag_search(query) or []
+
+    ctx: Dict[str, Any] = {
+        "profile": profile,
+        "recent": st,
+        "rag": rag,
+        "route": route,
+    }
+
+    parts: List[str] = []
+
+    if profile:
+        parts.append("[USER PROFILE]\n" + json.dumps(profile, ensure_ascii=False))
+    ltm_text = _ltm_block(user_id)
+    if ltm_text:
+        parts.append(ltm_text)
+    if st:
+        short = "\n".join(f"{m.get('role','user')}: {m.get('content','')}" for m in st)
+        parts.append("[RECENT MESSAGES]\n" + short)
+    if route.get("name"):
+        parts.append(f"[SEMANTIC ROUTE]\nname: {route['name']}  distance: {route.get('distance', 0.0):.4f}")
+    if rag:
+        snips = "\n".join(f"• {x.get('text','')} (src: {x.get('source','')})" for x in rag)
+        parts.append("[RAG]\n" + snips)
+
+    return "\n\n".join(parts), ctx
+
+
+# ---------------------------
+# Main orchestration
+# ---------------------------
+
+def answer_one(user_id: str, session_id: str, user_query: str) -> str:
+    # 0) Promote LTM from this turn (safe/no-op if structured LTM not present)
+    _promote_facts_from_turn(user_id, user_query)
+
+    # 1) Persona/mode from profile (set in UI)
+    profile = get_profile(user_id) or {}
+    persona = (profile.get("persona") or profile.get("mode") or "rag_strict").lower().strip()
+
+    # 2) Select prompts and temperatures for this persona
+    personalizer_sys, premium_sys, t_personalizer, t_premium = _select_prompts_and_temps(persona)
+
+    # 3) Build full context (profile + LTM + STM + route + RAG)
+    hit = sc.lookup(user_query)
+    context_text, ctx = build_context_blocks(user_id, session_id, user_query)
+    route_name = ctx.get("route", {}).get("name")
+    route_tag = f"[route: {route_name}]" if route_name else "[route: none]"
+    persona_tag = f"[persona: {persona}]"
+
+    # ---- Semantic cache HIT → personalize with cheap model ----
+    if hit:
+        generic = hit.get("generic_answer", "")
+        msg = [
+            {"role": "user", "content": f"Generic answer to personalize:\n{generic}"},
+            {"role": "user", "content": f"Additional context for personalization:\n{context_text}"},
+            {"role": "user", "content": f"User query (for final tweaks): {user_query}"},
+        ]
+        out = complete(
+            system=personalizer_sys,
+            messages=msg,
+            model=CHEAP_MODEL,
+            max_tokens=500,
+            temperature=t_personalizer,
+        )
+        return f"{out}\n\n_(Semantic cache hit → personalized)_\n{route_tag} {persona_tag}"
+
+    # ---- Semantic cache MISS → RAG + premium model, then store generic answer ----
+    msg = [
+        {"role": "user", "content": f"Question: {user_query}"},
+        {"role": "user", "content": f"Context to use strictly:\n{context_text}"},
+    ]
+    answer = complete(
+        system=premium_sys,
+        messages=msg,
+        model=PREMIUM_MODEL,
+        max_tokens=600,
+        temperature=t_premium,
+    )
+
+    # Meta kept small & safe for cache
+    sc.store(
+        user_query,
+        answer,
+        {
+            "kb_used": True,
+            "route": route_name,
+            "persona": persona,
+        },
+    )
+    return f"{answer}\n\n_(Cache miss → RAG + premium model; stored generic answer)_\n{route_tag} {persona_tag}"

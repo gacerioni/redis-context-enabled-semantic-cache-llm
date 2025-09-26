@@ -1,7 +1,10 @@
 # src/ui/gradio_app.py
+from __future__ import annotations
+
 import uuid
+from typing import List, Dict, Union, Any
+
 import gradio as gr
-from typing import List, Dict
 
 from src.config import (
     DEFAULT_USER_ID,
@@ -10,10 +13,16 @@ from src.config import (
     CHEAP_LLM,
 )
 from src.memory.short_term import append_short_term
-from src.memory.long_term import add_longterm_fact
 from src.profiles.user_profile import upsert_profile
 from src.workflows import answer_one
 from src.rag.pdf_ingest import ingest_uploaded_pdfs
+
+# Optional: best-effort LTM writes; don't let UI fail the chat if Redis hiccups
+try:
+    from src.memory.long_term import upsert_fact
+except Exception:  # pragma: no cover
+    def upsert_fact(*args, **kwargs):  # type: ignore
+        return None
 
 SESSION_ID = str(uuid.uuid4())
 
@@ -25,53 +34,73 @@ def chat_fn(
     locale: str,
     role: str,
     interest: str,
-    persona: str,   # <-- novo
+    persona: str,
 ):
     """
-    history is a list of dicts in messages format:
-      [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
-    Must return (updated_history, cleared_textbox)
+    Chatbot handler: history is a list of dicts in 'messages' format:
+    [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
+    Must return (updated_history, cleared_textbox).
     """
-    # Store/refresh user profile metadata (Hash)
+    message = (message or "").strip()
+    if not message:
+        return history or [], ""
+
+    # 1) Persist user profile (Hash)
     upsert_profile(
         DEFAULT_USER_ID,
         {
             "tone": tone,
             "locale": locale,
-            "name": "Gabriel Cerioni",             # demo identity (pode vir da UI se quiser)
+            #"name": "Janine Cerioni",  # demo identity; wire from UI if needed
             "role": role,
             "interest": interest,
-            "company": "Bradesco",
-            "persona": persona,                    # <-- gravamos a persona escolhida
-            "mode": persona,                       # alias comum
+            "company": "Redis",
+            "persona": persona,
+            "mode": persona,  # alias
         },
     )
 
-    # Persist some facts in long-term memory (RedisJSON array) – demo-only
-    add_longterm_fact(DEFAULT_USER_ID, f"persona={persona}")
-    add_longterm_fact(DEFAULT_USER_ID, f"locale={locale}")
-    add_longterm_fact(DEFAULT_USER_ID, f"tone={tone}")
+    # 2) Mirror key profile fields into LTM as structured facts (safe/no-op on failure)
+    try:
+        upsert_fact(DEFAULT_USER_ID, "persona", persona, source="ui", confidence=0.9)
+        upsert_fact(DEFAULT_USER_ID, "locale", locale, source="ui", confidence=0.9)
+        upsert_fact(DEFAULT_USER_ID, "tone", tone, source="ui", confidence=0.9)
+        if role:
+            upsert_fact(DEFAULT_USER_ID, "role", role, source="ui", confidence=0.8)
+        if interest:
+            upsert_fact(DEFAULT_USER_ID, "interest", interest, source="ui", confidence=0.7)
+    except Exception:
+        # Don't let LTM failures break chat
+        pass
 
-    # Short-term memory: append user turn
-    append_short_term(SESSION_ID, "user", message)
+    # 3) Short-term memory: append user turn
+    try:
+        append_short_term(SESSION_ID, "user", message)
+    except Exception:
+        pass
 
-    # Orchestrate CESC flow and get reply
+    # 4) Orchestrate full flow and get reply
     reply = answer_one(DEFAULT_USER_ID, SESSION_ID, message)
 
-    # Short-term memory: append assistant turn
-    append_short_term(SESSION_ID, "assistant", reply)
+    # 5) Short-term memory: append assistant turn
+    try:
+        append_short_term(SESSION_ID, "assistant", reply)
+    except Exception:
+        pass
 
-    # Update messages-format history for Gradio Chatbot
+    # 6) Update Chatbot history
     new_history = (history or []) + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": reply},
     ]
-    return new_history, ""  # clear the textbox
+    return new_history, ""
 
 
-def kb_ingest_fn(files: List[Dict]) -> str:
+def kb_ingest_fn(files: List[Union[str, bytes, Dict[str, Any]]]) -> str:
     """
-    Accepts payload from gr.Files(type='binary' or 'filepath').
+    Accepts payload from gr.Files in multiple shapes:
+      - type="filepath"  -> List[str] (paths)
+      - type="binary"    -> List[bytes] (or dicts with name/data/tempfile)
     """
     if not files:
         return "No PDFs selected."
@@ -82,16 +111,17 @@ def kb_ingest_fn(files: List[Dict]) -> str:
 
 
 def clear_chat():
-    # Apenas limpa a interface; STM expira por TTL no Redis.
+    # Only clears the UI; STM in Redis expires via TTL.
     return [], ""
 
 
-def build():
+def build() -> gr.Blocks:
     with gr.Blocks(title="Redis CESC + RAG Demo") as demo:
         # ===== HEADER =====
         gr.Markdown(
             "## Redis CESC + RAG — Demo\n"
-            "Assistente genérico com **Vector KB**, **memória** (curta e longa), **semantic cache**, **routing** e **upload de PDFs**.\n"
+            "Assistente genérico com **Vector KB**, **memória** (curta e longa), "
+            "**semantic cache**, **routing** e **upload de PDFs**.\n"
         )
 
         # ===== MODEL CARD =====
@@ -121,12 +151,12 @@ def build():
                 value="financial advisor",
                 label="Role",
             )
-            persona = gr.Dropdown(                   # <-- nova persona/mode
+            persona = gr.Dropdown(
                 [
-                    "rag_strict",                   # usa apenas contexto, sem alucinar
-                    "creative_helper",              # escreve com mais liberdade
-                    "analyst",                      # foco em steps/bullets/justificativas
-                    "support_agent",                # tom empático e procedural
+                    "rag_strict",
+                    "creative_helper",
+                    "analyst",
+                    "support_agent",
                 ],
                 value="rag_strict",
                 label="Persona/Mode",
@@ -141,6 +171,7 @@ def build():
 
         # ===== PDF UPLOAD =====
         with gr.Accordion("Add PDFs to Knowledge Base", open=False):
+            # Use type="filepath" for stable server-side reading
             pdfs = gr.Files(label="Upload PDFs", file_types=[".pdf"], type="filepath")
             with gr.Row():
                 ingest_btn = gr.Button("Ingest into KB")

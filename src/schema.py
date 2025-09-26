@@ -11,11 +11,10 @@ kb_schema = {
     "fields": [
         {"name": "doc_id", "type": "tag", "path": "$.doc_id"},
         {"name": "chunk_id", "type": "tag", "path": "$.chunk_id"},
-        # NEW: keep per-chunk filename + index for attribution
-        {"name": "file_name", "type": "text", "path": "$.file_name"},
         {"name": "chunk_index", "type": "numeric", "path": "$.chunk_index"},
         {"name": "text", "type": "text", "path": "$.text"},
         {"name": "source", "type": "text", "path": "$.source"},
+        {"name": "file_name", "type": "text", "path": "$.file_name"},
         {
             "name": "embedding",
             "type": "vector",
